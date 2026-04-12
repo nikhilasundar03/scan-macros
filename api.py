@@ -34,6 +34,11 @@ class LogFoodBody(BaseModel):
     grams: float = Field(..., gt=0, description="Portion size in grams")
 
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
 @app.post("/log")
 def post_log(body: LogFoodBody):
     try:
