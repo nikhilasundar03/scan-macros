@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from PIL import Image, UnidentifiedImageError
 from transformers import pipeline
 
-from db import get_daily_total, init_db, log_food
+from db import get_daily_total, init_db, log_food, scaled_nutrients_for_food
 
 
 @asynccontextmanager
@@ -37,10 +37,10 @@ class LogFoodBody(BaseModel):
     grams: float = Field(..., gt=0, description="Portion size in grams")
 
 
-def log_food_with_http_errors(food: str, grams: float) -> None:
+def log_food_with_http_errors(food: str, grams: float) -> dict:
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            log_food(food.strip(), grams)
+            return log_food(food.strip(), grams)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except KeyError as e:
@@ -57,6 +57,25 @@ def log_food_with_http_errors(food: str, grams: float) -> None:
         ) from e
 
 
+def _nutrition_preview_for_label(label: str, grams: float) -> dict:
+    """USDA preview for classifier labels; failures become nutrition_error (no HTTP error)."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            scaled = scaled_nutrients_for_food(label.strip(), grams)
+        return {"nutrition": scaled}
+    except ValueError as e:
+        return {"nutrition": None, "nutrition_error": str(e)}
+    except KeyError as e:
+        return {"nutrition": None, "nutrition_error": f"USDA data incomplete: {e}"}
+    except IndexError:
+        return {
+            "nutrition": None,
+            "nutrition_error": "No USDA search results for that food. Try a different query.",
+        }
+    except requests.RequestException as e:
+        return {"nutrition": None, "nutrition_error": f"Could not reach USDA API: {e}"}
+
+
 @lru_cache(maxsize=1)
 def get_food_classifier():
     # Local open-source classifier trained on Food-101 classes.
@@ -70,8 +89,17 @@ def health():
 
 @app.post("/log")
 def post_log(body: LogFoodBody):
-    log_food_with_http_errors(body.food, body.grams)
-    return {"status": "logged", "food": body.food.strip(), "grams": body.grams}
+    row = log_food_with_http_errors(body.food, body.grams)
+    return {
+        "status": "logged",
+        "food": row["name"],
+        "grams": row["grams"],
+        "date": row["date"],
+        "calories": row["calories"],
+        "protein": row["protein"],
+        "carbohydrates": row["carbohydrates"],
+        "fat": row["fat"],
+    }
 
 
 @app.get("/totals")
@@ -83,11 +111,17 @@ def get_totals(for_date: Optional[str] = None):
 
 
 @app.post("/classify")
-async def classify_food_image(image: UploadFile = File(...), top_k: int = 3):
+async def classify_food_image(
+    image: UploadFile = File(...),
+    top_k: int = 3,
+    grams: Optional[float] = None,
+):
     if not image.content_type or not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Upload an image file (image/*).")
     if not (1 <= top_k <= 10):
         raise HTTPException(status_code=400, detail="top_k must be between 1 and 10.")
+    if grams is not None and grams <= 0:
+        raise HTTPException(status_code=400, detail="grams must be > 0 when provided.")
 
     try:
         raw = await image.read()
@@ -101,19 +135,24 @@ async def classify_food_image(image: UploadFile = File(...), top_k: int = 3):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Classification failed: {e}") from e
 
-    labels = [
-        {
+    labels = []
+    for pred in predictions:
+        item = {
             "label": pred["label"].replace("_", " "),
             "score": float(pred["score"]),
         }
-        for pred in predictions
-    ]
+        if grams is not None:
+            item.update(_nutrition_preview_for_label(item["label"], grams))
+        labels.append(item)
 
-    return {
+    out = {
         "filename": image.filename,
         "top_k": top_k,
         "predictions": labels,
     }
+    if grams is not None:
+        out["grams"] = grams
+    return out
 
 
 @app.post("/classify-log")
@@ -125,12 +164,12 @@ async def classify_and_log_food(
 ):
     if grams <= 0:
         raise HTTPException(status_code=400, detail="grams must be > 0.")
-    classification = await classify_food_image(image=image, top_k=top_k)
+    classification = await classify_food_image(image=image, top_k=top_k, grams=grams)
     top_label = classification["predictions"][0]["label"]
 
     override = (food_override or "").strip()
     food_to_log = override if override else top_label
-    log_food_with_http_errors(food_to_log, grams)
+    logged = log_food_with_http_errors(food_to_log, grams)
 
     return {
         "status": "logged",
@@ -140,4 +179,13 @@ async def classify_and_log_food(
         "used_override": bool(override),
         "grams": grams,
         "predictions": classification["predictions"],
+        "logged": {
+            "name": logged["name"],
+            "grams": logged["grams"],
+            "date": logged["date"],
+            "calories": logged["calories"],
+            "protein": logged["protein"],
+            "carbohydrates": logged["carbohydrates"],
+            "fat": logged["fat"],
+        },
     }
