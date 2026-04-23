@@ -2,3 +2,8 @@
 .venv/
 __pycache__/
 *.pyc
+# Xcode user/local files
+**/xcuserdata/
+**/*.xcuserstate
+DerivedData/
+build/
